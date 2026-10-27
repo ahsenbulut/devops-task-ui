@@ -20,6 +20,11 @@ LABEL org.opencontainers.image.title="devops-task-ui" \
       org.opencontainers.image.description="OpsDesk web UI" \
       org.opencontainers.image.source="https://github.com/ahsenbulut/devops-task-ui"
 
+# Alpine security fixes not yet in the pinned base image (CVE-2026-111497, CVE-2026-92392).
+# Remove once the base image digest is updated to a release that contains them.
+USER root
+RUN apk add --no-cache --upgrade 'brotli-libs>=1.2.1-r0' 'curl>=8.23.0-r0' 'libcurl>=8.23.0-r0'
+
 COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 
