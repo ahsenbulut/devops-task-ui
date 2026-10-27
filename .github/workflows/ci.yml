@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: CI
+    uses: ahsenbulut/devops-task-ci/.github/workflows/node-ci.yml@ca3b3112440a7066ec926f8fcb79c7e83f0c631b # main
+    permissions:
+      contents: read
+    with:
+      postgres: false
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

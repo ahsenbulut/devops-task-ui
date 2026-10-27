@@ -1,0 +1,428 @@
+name: Release
+
+on:
+  # zizmor: ignore[dangerous-triggers] PR runs are rejected, no CI artifacts are consumed and only a verified main commit is checked out.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE_NAME: devops-task-ui
+  PLATFORMS: linux/amd64,linux/arm64
+  STAGING_IMAGE: localhost:5000/devops-task-ui
+
+jobs:
+  verify-ci:
+    name: Verify CI result and commit
+    # workflow_run also fires for PR runs (including forks with a branch named "main"):
+    # only successful push runs from this repository are allowed to continue.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - name: Verify CI run and that the commit is on main
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid commit SHA: ${HEAD_SHA}"
+            exit 1
+          fi
+
+          IFS=$'\t' read -r conclusion event branch sha path head_repo < <(
+            gh api "repos/${REPO}/actions/runs/${RUN_ID}" \
+              --jq '[.conclusion, .event, .head_branch, .head_sha, .path, .head_repository.full_name] | @tsv'
+          )
+          echo "CI run ${RUN_ID}: conclusion=${conclusion} event=${event} branch=${branch} sha=${sha} path=${path} repo=${head_repo}"
+
+          if [[ "${conclusion}" != "success" || "${event}" != "push" || "${branch}" != "main" \
+             || "${sha}" != "${HEAD_SHA}" || "${path}" != ".github/workflows/ci.yml" \
+             || "${head_repo}" != "${REPO}" ]]; then
+            echo "::error::CI run ${RUN_ID} is not a successful push run of ci.yml on main for ${HEAD_SHA}"
+            exit 1
+          fi
+
+          status="$(gh api "repos/${REPO}/compare/${HEAD_SHA}...main" --jq .status)"
+          if [[ "${status}" != "identical" && "${status}" != "ahead" ]]; then
+            echo "::error::Commit ${HEAD_SHA} is not part of main (compare status: ${status})"
+            exit 1
+          fi
+
+          echo "sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+
+  build-scan-publish:
+    name: Build, scan and publish image
+    needs: verify-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+    # Runner-local registry: the candidate image is only reachable inside this job until it passes the scan.
+    services:
+      registry:
+        image: registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+        ports:
+          - 5000:5000
+    env:
+      SHA: ${{ needs.verify-ci.outputs.sha }}
+      TRIVY_VERSION: 0.75.0
+      TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      # ---------------------------------------------------------------- build
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+
+      - name: Use commit time as build timestamp
+        id: epoch
+        run: |
+          epoch="$(git log -1 --format=%ct)"
+          [[ "${epoch}" =~ ^[0-9]+$ ]]
+          echo "value=${epoch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+
+      # context: . is required; the default Git context would build github.sha (latest main), not the verified commit.
+      - name: Build multi-arch image to staging registry
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ env.STAGING_IMAGE }}:${{ env.SHA }}
+          labels: org.opencontainers.image.revision=${{ env.SHA }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-${{ env.IMAGE_NAME }}
+          cache-to: type=gha,mode=max,scope=release-${{ env.IMAGE_NAME }}
+
+      # ----------------------------------------------------------------- scan
+      - name: Install Trivy (checksum verified)
+        run: |
+          archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" trivy
+          "${RUNNER_TEMP}/trivy" --version
+
+      - name: Scan image (all platforms)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: |
+          mkdir -p trivy-reports
+          for platform in ${PLATFORMS//,/ }; do
+            arch="${platform#linux/}"
+            "${RUNNER_TEMP}/trivy" image \
+              --skip-version-check \
+              --image-src remote \
+              --platform "${platform}" \
+              --scanners vuln,secret \
+              --timeout 10m \
+              --format json \
+              --output "trivy-reports/trivy-${arch}.json" \
+              "${STAGING_IMAGE}@${DIGEST}"
+            "${RUNNER_TEMP}/trivy" convert --format sarif \
+              --output "trivy-reports/trivy-${arch}.sarif" "trivy-reports/trivy-${arch}.json"
+          done
+
+      - name: Upload Trivy reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-reports-${{ env.SHA }}
+          path: trivy-reports/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Enforce vulnerability policy (HIGH, CRITICAL)
+        run: |
+          blocked=0
+          for platform in ${PLATFORMS//,/ }; do
+            arch="${platform#linux/}"
+            rc=0
+            "${RUNNER_TEMP}/trivy" convert --format table \
+              --severity HIGH,CRITICAL --exit-code 3 \
+              --output "trivy-reports/policy-${arch}.txt" "trivy-reports/trivy-${arch}.json" || rc=$?
+            case "${rc}" in
+              0) echo "${platform}: no HIGH/CRITICAL findings" ;;
+              3) echo "::error::${platform}: HIGH/CRITICAL findings, image will not be published"
+                 cat "trivy-reports/policy-${arch}.txt"
+                 blocked=1 ;;
+              *) echo "::error::${platform}: could not evaluate scan report (exit ${rc})"
+                 exit "${rc}" ;;
+            esac
+          done
+          exit "${blocked}"
+
+      # -------------------------------------------------------------- publish
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Copies the scanned index (both platforms + SBOM/provenance) by digest; nothing is rebuilt.
+      - name: Publish scanned image to Docker Hub
+        id: publish
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" ]]; then
+            echo "::error::Repository variable DOCKERHUB_USERNAME is not set"
+            exit 1
+          fi
+          image="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          target="${image}:sha-${SHA}"
+
+          existing="$(docker buildx imagetools inspect "${target}" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest || true)"
+          if [[ -n "${existing}" && "${existing}" != "${DIGEST}" ]]; then
+            echo "::error::${target} already exists with digest ${existing}; immutable tags are not overwritten"
+            exit 1
+          elif [[ "${existing}" == "${DIGEST}" ]]; then
+            echo "${target} already points to ${DIGEST}, nothing to publish"
+          else
+            docker buildx imagetools create --tag "${target}" "${STAGING_IMAGE}@${DIGEST}"
+          fi
+
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "target=${target}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify published image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TARGET: ${{ steps.publish.outputs.target }}
+          IMAGE: ${{ steps.publish.outputs.image }}
+        run: |
+          manifest="$(docker buildx imagetools inspect "${TARGET}" --format '{{json .Manifest}}')"
+          published="$(jq -r .digest <<< "${manifest}")"
+          platforms="$(jq -r '[.manifests[] | select(.platform.os == "linux") | "linux/" + .platform.architecture] | sort | join(",")' <<< "${manifest}")"
+
+          if [[ "${published}" != "${DIGEST}" ]]; then
+            echo "::error::Published digest ${published} does not match scanned digest ${DIGEST}"
+            exit 1
+          fi
+          if [[ "${platforms}" != "${PLATFORMS}" ]]; then
+            echo "::error::Expected platforms ${PLATFORMS}, found ${platforms}"
+            exit 1
+          fi
+
+          {
+            echo "### Published image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${TARGET}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Pull by digest | \`${IMAGE}@${DIGEST}\` |"
+            echo "| Platforms | ${platforms} |"
+            echo "| Commit | \`${SHA}\` |"
+            echo "| Trivy | ${TRIVY_VERSION}, no HIGH/CRITICAL findings |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "Published ${TARGET} (${DIGEST}) for ${platforms}"
+
+  update-gitops:
+    name: Update GitOps repository
+    needs: [verify-ci, build-scan-publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    env:
+      SHA: ${{ needs.verify-ci.outputs.sha }}
+      IMAGE: ${{ needs.build-scan-publish.outputs.image }}
+      DIGEST: ${{ needs.build-scan-publish.outputs.digest }}
+      GITOPS_REPO: ahsenbulut/devops-task-gitops
+      OVERLAY: apps/task-ui/overlays/dev
+      FIRST_DEPLOY_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - name: Validate release outputs and published image
+        run: |
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA '${SHA}'"; exit 1; }
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Invalid digest '${DIGEST}'"; exit 1; }
+          [[ "${IMAGE}" =~ ^docker\.io/[a-z0-9._-]+/${IMAGE_NAME}$ ]] || { echo "::error::Unexpected image '${IMAGE}'"; exit 1; }
+
+          manifest="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Manifest}}')"
+          [[ "$(jq -r .digest <<< "${manifest}")" == "${DIGEST}" ]] || { echo "::error::${IMAGE}@${DIGEST} not found on Docker Hub"; exit 1; }
+          platforms="$(jq -r '[.manifests[] | select(.platform.os == "linux") | "linux/" + .platform.architecture] | sort | join(",")' <<< "${manifest}")"
+          [[ "${platforms}" == "${PLATFORMS}" ]] || { echo "::error::Expected ${PLATFORMS}, found ${platforms}"; exit 1; }
+
+          revisions="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Image}}' \
+            | jq -r '[.[].config.Labels["org.opencontainers.image.revision"]] | unique | join(",")')"
+          [[ "${revisions}" == "${SHA}" ]] || { echo "::error::Image revision label '${revisions}' does not match ${SHA}"; exit 1; }
+          echo "Verified ${IMAGE}@${DIGEST} (${platforms}) built from ${SHA}"
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: main
+          path: gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          persist-credentials: false
+
+      - name: Update image digest and push
+        id: update
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_REPO: ${{ github.repository }}
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          kustomization="${OVERLAY}/kustomization.yaml"
+          auth="$(printf 'x-access-token:%s' "${GITOPS_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git_auth() {
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" \
+            git "$@"
+          }
+          rendered_image() {
+            local images
+            images="$(kubectl kustomize "${OVERLAY}" | sed -n 's/^ *image: *//p')"
+            [[ "$(grep -cF "${IMAGE}@" <<< "${images}" || true)" == "1" ]] || { echo "::error::Expected exactly one ${IMAGE} image in rendered manifests" >&2; return 1; }
+            grep -F "${IMAGE}@" <<< "${images}"
+          }
+
+          status="$(gh api "repos/${APP_REPO}/compare/${SHA}...main" --jq .status)"
+          if [[ "${status}" != "identical" && "${status}" != "ahead" ]]; then
+            echo "::error::Commit ${SHA} is no longer part of main (compare status: ${status})"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          target="${IMAGE}@${DIGEST}"
+
+          for attempt in 1 2 3; do
+            git_auth fetch --quiet origin main
+            git reset --quiet --hard origin/main
+
+            current="$(rendered_image)"
+            if [[ "${current}" == "${target}" ]]; then
+              echo "GitOps already deploys ${target}; nothing to do"
+              echo "result=unchanged" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            current_digest="${current##*@}"
+            [[ "${current}" == "${IMAGE}@${current_digest}" && "${current_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::Unexpected current image reference '${current}'"; exit 1; }
+
+            if [[ "${current_digest}" == "${FIRST_DEPLOY_DIGEST}" ]]; then
+              echo "First deployment: GitOps still holds the placeholder digest"
+              order=ahead
+            else
+              deployed_sha="$(docker buildx imagetools inspect "${current}" --format '{{json .Image}}' \
+                | jq -r '[.[].config.Labels["org.opencontainers.image.revision"]] | unique | join(",")')"
+              [[ "${deployed_sha}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Cannot determine source commit of ${current}"; exit 1; }
+              order="$(gh api "repos/${APP_REPO}/compare/${deployed_sha}...${SHA}" --jq .status)"
+            fi
+            case "${order}" in
+              ahead) ;;
+              behind|identical)
+                echo "::notice::Skipping stale release: ${SHA} is not newer than deployed ${deployed_sha}"
+                echo "result=stale" >> "${GITHUB_OUTPUT}"
+                exit 0 ;;
+              *)
+                echo "::error::Cannot order ${SHA} against deployed ${deployed_sha} (compare status: ${order})"
+                exit 1 ;;
+            esac
+
+            [[ "$(grep -c -F "${current_digest}" "${kustomization}")" == "1" ]] \
+              || { echo "::error::Expected exactly one '${current_digest}' in ${kustomization}"; exit 1; }
+            before="$(kubectl kustomize "${OVERLAY}")"
+            sed -i "s/${current_digest}/${DIGEST}/" "${kustomization}"
+            after="$(kubectl kustomize "${OVERLAY}")"
+
+            [[ "$(rendered_image)" == "${target}" ]] || { echo "::error::Rendered image does not match ${target}"; exit 1; }
+            changed="$(diff <(echo "${before}") <(echo "${after}") | grep -c '^[<>]' || true)"
+            [[ "${changed}" == "2" ]] || { echo "::error::Render changed ${changed} lines, expected only the image line"; exit 1; }
+            [[ "$(git status --porcelain)" == " M ${kustomization}" ]] || { echo "::error::Unexpected files changed"; git status --porcelain; exit 1; }
+
+            git commit --quiet -m "chore(deploy): update task-ui image to ${SHA::7}" \
+              -m "Source commit: ${APP_REPO}@${SHA}" \
+              -m "Image: ${target}" \
+              -m "Release run: ${RUN_URL}" \
+              -- "${kustomization}"
+
+            if git_auth push --quiet origin HEAD:main; then
+              echo "Pushed $(git rev-parse HEAD) to ${GITOPS_REPO}@main"
+              echo "result=updated" >> "${GITHUB_OUTPUT}"
+              echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}), refetching main and re-evaluating"
+          done
+          echo "::error::Could not push to ${GITOPS_REPO} after 3 attempts"
+          exit 1
+
+      - name: Report result
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ steps.update.outputs.result }}
+          COMMIT: ${{ steps.update.outputs.commit }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [[ "${JOB_STATUS}" != "success" ]]; then
+            echo "::error::GitOps update failed. ${IMAGE}@${DIGEST} WAS published to Docker Hub but is NOT deployed."
+          fi
+          {
+            echo "### GitOps update"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image (published) | \`${IMAGE}@${DIGEST}\` |"
+            echo "| Source commit | \`${SHA}\` |"
+            echo "| GitOps result | ${RESULT:-failed} |"
+            echo "| GitOps commit | ${COMMIT:+https://github.com/${GITOPS_REPO}/commit/${COMMIT}} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
